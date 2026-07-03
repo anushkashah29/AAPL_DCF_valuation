@@ -9,6 +9,7 @@ import sys
 import os
 import argparse
 import yfinance as yf
+import numpy as np
 from openpyxl import Workbook
 from openpyxl.styles import (
     Font, PatternFill, Alignment, Border, Side, numbers
@@ -117,6 +118,54 @@ def row_val(df, key, col=0, default=0):
 
 def fiscal_years(fin):
     return [str(c.year) for c in fin.columns]
+
+
+def derive_beta(ticker_sym, period="5y", interval="1wk"):
+    """Derive levered beta via OLS regression of weekly returns against S&P 500.
+    Returns a dict of all intermediate values, or None on failure."""
+    try:
+        stock = yf.download(ticker_sym, period=period, interval=interval,
+                            progress=False, auto_adjust=True)
+        mkt   = yf.download("^GSPC",   period=period, interval=interval,
+                            progress=False, auto_adjust=True)
+        if stock.empty or mkt.empty:
+            return None
+        s = stock["Close"]
+        m = mkt["Close"]
+        if hasattr(s, "squeeze"):
+            s = s.squeeze()
+        if hasattr(m, "squeeze"):
+            m = m.squeeze()
+        s, m = s.align(m, join="inner")
+        sr = s.pct_change().dropna()
+        mr = m.pct_change().dropna()
+        sr, mr = sr.align(mr, join="inner")
+        sr = sr.dropna()
+        mr = mr.dropna()
+        n = len(sr)
+        if n < 52:
+            return None
+        cov_mat = np.cov(sr.values, mr.values)
+        cov_val = float(cov_mat[0, 1])
+        var_val = float(cov_mat[1, 1])
+        raw_b   = cov_val / var_val
+        r_sq    = float(np.corrcoef(sr.values, mr.values)[0, 1] ** 2)
+        adj_b   = (2 / 3) * raw_b + (1 / 3) * 1.0
+        return {
+            "raw_beta":  round(raw_b, 4),
+            "adj_beta":  round(adj_b, 4),
+            "r_sq":      round(r_sq, 4),
+            "n":         n,
+            "avg_stock": round(float(sr.mean()), 6),
+            "avg_mkt":   round(float(mr.mean()), 6),
+            "std_stock": round(float(sr.std()), 6),
+            "std_mkt":   round(float(mr.std()), 6),
+            "cov":       round(cov_val, 8),
+            "var_mkt":   round(var_val, 8),
+        }
+    except Exception:
+        return None
+
 
 # ── Sheet builders ─────────────────────────────────────────────────────────────
 
@@ -827,6 +876,7 @@ def build_dcf(wb, info, sym):
         ("Change in NWC as % of Rev",   [0.005]*6 + [None]),
         ("WACC (Discount Rate)",         ["='WACC Calculation'!B25"] + [None]*6),
         ("Terminal Growth Rate (g)",     [0.025] + [None]*6),
+        ("Exit Multiple (EV/EBITDA ×)",  [None]*6 + [20.0]),
     ]
 
     assumption_rows = {}
@@ -841,6 +891,8 @@ def build_dcf(wb, info, sym):
                     c.number_format = FMT_PCT
                 elif isinstance(v, str) and v.startswith("="):
                     c.number_format = FMT_PCT  # formula references are always rate/pct here
+                elif isinstance(v, float) and v >= 2:
+                    c.number_format = '0.0"x"'  # exit multiple e.g. "20.0x"
                 else:
                     c.number_format = FMT_USD
                 c.alignment = _align(h="center")
@@ -855,6 +907,7 @@ def build_dcf(wb, info, sym):
     da_row   = assumption_rows["D&A as % of Revenue"]
     cx_row   = assumption_rows["CapEx as % of Revenue"]
     nwc_row  = assumption_rows["Change in NWC as % of Rev"]
+    em_row   = assumption_rows["Exit Multiple (EV/EBITDA ×)"]
 
     # Projections
     r += 1
@@ -923,6 +976,25 @@ def build_dcf(wb, info, sym):
     style(ws, r, 9, "Gordon Growth Model; WACC must exceed g or result is undefined — adjust assumptions if negative", italic=True, size=9, color="555555")
     tv_row = r; r += 1
 
+    # Exit Multiple Terminal Value
+    r += 1
+    section_label(ws, r, "  STEP 2B: TERMINAL VALUE (Exit Multiple Method — EV/EBITDA)"); r += 1
+
+    style(ws, r, 1, "Year 5 EBITDA = EBIT + D&A", bold=True)
+    style(ws, r, 2, f"=G{ebit_proj_row}+G{da_proj_row}", fmt=FMT_USD, align="right", bold=True)
+    style(ws, r, 9, "Year 5 projected EBIT + D&A from assumptions above; exit multiple applied to this", italic=True, size=9, color="555555")
+    ebitda_y5_row = r; r += 1
+
+    style(ws, r, 1, "EV/EBITDA Exit Multiple", bold=True, color=BLUE_TEXT)
+    style(ws, r, 2, f"=H{em_row}", fmt='0.0"x"', align="right", bold=True, color=BLUE_TEXT)
+    style(ws, r, 9, "From assumption table above (col H); update based on peer median in Trading Comps", italic=True, size=9, color="555555")
+    exit_mult_ref_row = r; r += 1
+
+    style(ws, r, 1, "TV = Year 5 EBITDA × Exit Multiple", bold=True)
+    style(ws, r, 2, f"=B{ebitda_y5_row}*B{exit_mult_ref_row}", fmt=FMT_USD, align="right", bold=True, fill=LIGHT_BLUE)
+    style(ws, r, 9, "EV at Year 5 using market-based multiple; alternative to perpetuity growth (GGM)", italic=True, size=9, color="555555")
+    tv_exit_row = r; r += 1
+
     # PV
     r += 1
     section_label(ws, r, "  STEP 3: DISCOUNT TO PRESENT VALUE"); r += 1
@@ -943,10 +1015,15 @@ def build_dcf(wb, info, sym):
         style(ws, r, col, f"={cl}{ufcf_row}*{cl}{pv_factor_row}", fmt=FMT_USD, align="right", bold=True)
     pv_ufcf_row = r; r += 1
 
-    style(ws, r, 1, "PV of Terminal Value", bold=True)
+    style(ws, r, 1, "PV of Terminal Value (GGM)", bold=True)
     style(ws, r, 2, f"=B{tv_row}/(1+$B${wacc_row})^5", fmt=FMT_USD, align="right", bold=True, fill=LIGHT_BLUE)
-    style(ws, r, 9, "Terminal Value discounted back 5 years at WACC; typically 60-80% of total EV", italic=True, size=9, color="555555")
+    style(ws, r, 9, "GGM Terminal Value discounted back 5 years at WACC; typically 60-80% of total EV", italic=True, size=9, color="555555")
     pv_tv_row = r; r += 1
+
+    style(ws, r, 1, "PV of Terminal Value (Exit Multiple)", bold=True)
+    style(ws, r, 2, f"=B{tv_exit_row}/(1+$B${wacc_row})^5", fmt=FMT_USD, align="right", bold=True, fill=LIGHT_BLUE)
+    style(ws, r, 9, "Exit Multiple TV discounted back 5 years at WACC", italic=True, size=9, color="555555")
+    pv_tv_exit_row = r; r += 1
 
     # Bridge
     r += 1
@@ -992,10 +1069,52 @@ def build_dcf(wb, info, sym):
     style(ws, r, 9, "Diluted count includes options and RSUs; source: Yahoo Finance", italic=True, size=9, color="555555")
     shares_dcf_row = r; r += 1
 
-    style(ws, r, 1, "INTRINSIC VALUE PER SHARE (DCF)", bold=True, size=11)
+    style(ws, r, 1, "INTRINSIC VALUE PER SHARE (GGM)", bold=True, size=11)
     style(ws, r, 2, f"=B{eq_val_row}/B{shares_dcf_row}", fmt="$#,##0.00", align="right", bold=True, fill=LIGHT_BLUE)
     style(ws, r, 9, "= Equity Value / Diluted Shares; compare to current market price for buy/sell signal", italic=True, size=9, color="555555")
     price_row = r; r += 1
+
+    # Exit Multiple bridge
+    r += 1
+    section_label(ws, r, "  STEP 4B: BRIDGE TO EQUITY VALUE — EXIT MULTIPLE METHOD"); r += 1
+
+    style(ws, r, 1, "Sum of PV of UFCFs (Years 1–5)")
+    style(ws, r, 2, f"=SUM(C{pv_ufcf_row}:G{pv_ufcf_row})", fmt=FMT_USD, align="right")
+    sum_pv_exit_row = r; r += 1
+
+    style(ws, r, 1, "PV of Terminal Value (Exit Multiple)")
+    style(ws, r, 2, f"=B{pv_tv_exit_row}", fmt=FMT_USD, align="right", color=GREEN_TEXT)
+    pv_tv_exit_ref_row = r; r += 1
+
+    style(ws, r, 1, "TV as % of Total EV (Exit Method)", italic=True)
+    style(ws, r, 2, f"=B{pv_tv_exit_ref_row}/(B{sum_pv_exit_row}+B{pv_tv_exit_ref_row})", fmt=FMT_PCT, align="right")
+    r += 1
+
+    style(ws, r, 1, "ENTERPRISE VALUE (Exit Multiple Method)", bold=True, size=11)
+    style(ws, r, 2, f"=B{sum_pv_exit_row}+B{pv_tv_exit_ref_row}", fmt=FMT_USD, align="right", bold=True, fill=LIGHT_BLUE)
+    style(ws, r, 9, "= PV UFCFs + PV Exit TV; parallel to GGM EV above", italic=True, size=9, color="555555")
+    ev_exit_row = r; r += 1
+
+    style(ws, r, 1, "Add: Cash & Equivalents ($M)", color=BLUE_TEXT)
+    style(ws, r, 2, cash, fmt=FMT_USD, align="right")
+    cash_exit_row = r; r += 1
+
+    style(ws, r, 1, "Less: Total Debt ($M)", color=BLUE_TEXT)
+    style(ws, r, 2, -abs(debt), fmt=FMT_USD, align="right")
+    debt_exit_row = r; r += 1
+
+    style(ws, r, 1, "Equity Value — Exit Multiple ($M)", bold=True)
+    style(ws, r, 2, f"=B{ev_exit_row}+B{cash_exit_row}+B{debt_exit_row}", fmt=FMT_USD, align="right", bold=True, fill=LIGHT_GRAY)
+    eq_exit_row = r; r += 1
+
+    style(ws, r, 1, "Diluted Shares Outstanding (M)", color=BLUE_TEXT)
+    style(ws, r, 2, shares, fmt=FMT_2DP, align="right")
+    shares_exit_row = r; r += 1
+
+    style(ws, r, 1, "INTRINSIC VALUE PER SHARE (Exit Multiple)", bold=True, size=11)
+    style(ws, r, 2, f"=B{eq_exit_row}/B{shares_exit_row}", fmt="$#,##0.00", align="right", bold=True, fill=LIGHT_BLUE)
+    style(ws, r, 9, "Parallel to GGM method; uses market-based exit multiple instead of perpetuity growth", italic=True, size=9, color="555555")
+    price_exit_row = r; r += 1
 
     # Sensitivity
     r += 1
@@ -1028,8 +1147,42 @@ def build_dcf(wb, info, sym):
                 c.fill = _fill(LIGHT_BLUE)
         r += 1
 
+    # Exit Multiple sensitivity
+    r += 2
+    section_label(ws, r, "  STEP 6: SENSITIVITY — Share Price vs WACC & EV/EBITDA Exit Multiple"); r += 1
 
-def build_wacc(wb, info, sym):
+    em_vals = [15.0, 17.0, 20.0, 23.0, 25.0]
+
+    style(ws, r, 1, "→ EV/EBITDA Exit Multiple", italic=True)
+    for i, em in enumerate(em_vals):
+        c = ws.cell(row=r, column=i + 3, value=em)
+        c.number_format = '0.0"x"'
+        c.font = _font(bold=True)
+        c.alignment = _align(h="center")
+    r += 1
+
+    ebit_margin_s  = safe(info, "operatingMargins", 0.30)
+    da_pct_s       = 0.03
+    avg_growth_s   = (0.05 + 0.07 + 0.08 + 0.08 + 0.06) / 5
+    base_rev_s     = safe(info, "totalRevenue", 0) / 1e6
+    year5_rev_s    = base_rev_s * (1 + avg_growth_s) ** 5
+    year5_ebitda_s = year5_rev_s * (ebit_margin_s + da_pct_s)
+
+    for w in w_vals:
+        style(ws, r, 1, f"WACC = {w:.1%}", bold=True)
+        style(ws, r, 2, w, fmt=FMT_PCT, align="right")
+        for i, em in enumerate(em_vals):
+            pv_tv_em = (year5_ebitda_s * em) / (1 + w) ** 5
+            val_em   = pv_tv_em / shares if shares else 0
+            c = ws.cell(row=r, column=i + 3, value=round(val_em, 2))
+            c.number_format = "$#,##0.00"
+            c.alignment = _align(h="center")
+            if abs(w - w_vals[2]) < 0.001 and abs(em - 20.0) < 0.001:
+                c.fill = _fill(LIGHT_BLUE)
+        r += 1
+
+
+def build_wacc(wb, info, sym, beta_data=None):
     ws = wb.create_sheet("WACC Calculation")
     ws.sheet_view.showGridLines = False
     ws.sheet_properties.tabColor = "1A5276"
@@ -1080,7 +1233,14 @@ def build_wacc(wb, info, sym):
 
     style(ws, r, 1, "Risk-Free Rate (Rf)", color=BLUE_TEXT); ws.cell(row=r, column=2, value=0.045).number_format = FMT_PCT; ws.cell(row=r, column=2).font = _font(color=BLUE_TEXT); ws.cell(row=r, column=2).alignment = _align(h="right"); style(ws, r, 3, "10-year US Treasury yield", size=9, color="555555"); rows["rf"] = r; r += 1
     style(ws, r, 1, "Equity Risk Premium (ERP)", color=BLUE_TEXT); ws.cell(row=r, column=2, value=0.055).number_format = FMT_PCT; ws.cell(row=r, column=2).font = _font(color=BLUE_TEXT); ws.cell(row=r, column=2).alignment = _align(h="right"); style(ws, r, 3, "Damodaran implied ERP", size=9, color="555555"); rows["erp"] = r; r += 1
-    style(ws, r, 1, "Beta (Levered β)", color=BLUE_TEXT); ws.cell(row=r, column=2, value=beta).number_format = FMT_2DP; ws.cell(row=r, column=2).font = _font(color=BLUE_TEXT); ws.cell(row=r, column=2).alignment = _align(h="right"); style(ws, r, 3, "Source: Yahoo Finance", size=9, color="555555"); rows["beta"] = r; r += 1
+    raw_b = beta_data["raw_beta"] if beta_data else beta
+    adj_b = beta_data["adj_beta"] if beta_data else round((2 / 3) * beta + (1 / 3) * 1.0, 4)
+    style(ws, r, 1, "Beta (Blume-Adjusted, Levered β)", color=BLUE_TEXT)
+    ws.cell(row=r, column=2, value=adj_b).number_format = FMT_2DP
+    ws.cell(row=r, column=2).font = _font(color=BLUE_TEXT)
+    ws.cell(row=r, column=2).alignment = _align(h="right")
+    style(ws, r, 3, f"Blume adj: ⅔×{raw_b:.4f} + ⅓×1.0 = {adj_b:.4f}  |  Raw OLS derived: {raw_b:.4f}", size=9, color="555555")
+    rows["beta"] = r; r += 1
 
     style(ws, r, 1, "Cost of Equity (Re)", bold=True)
     style(ws, r, 2, f"=B{rows['rf']}+B{rows['beta']}*B{rows['erp']}", fmt=FMT_PCT, align="right", bold=True, fill=LIGHT_BLUE)
@@ -1120,6 +1280,149 @@ def build_wacc(wb, info, sym):
     style(ws, r, 2, f"=B{eq_comp_row}+B{dt_comp_row}", fmt=FMT_PCT, align="right", bold=True, fill=LIGHT_BLUE)
     style(ws, r, 4, "Links to DCF Model assumptions", italic=True, size=9, color=GREEN_TEXT)
     r += 1
+
+    # ── Beta Derivation (placed after WACC to preserve row 25 reference in DCF) ──
+    r += 1
+    header_row(ws, r, "BETA DERIVATION — STEP-BY-STEP (OLS Regression, 5Y Weekly vs S&P 500)", bg=HEADER_BG); r += 1
+    col_headers(ws, r, ["Step", "Value", "Formula / Source", "Notes"], start_col=1); r += 1
+
+    bd = beta_data  # shorthand
+
+    # Setup
+    section_label(ws, r, "  SETUP"); r += 1
+    style(ws, r, 1, "Regression Period")
+    ws.cell(row=r, column=2, value="5 Years").alignment = _align(h="right")
+    style(ws, r, 3, "5Y weekly (Fri-to-Fri) price returns")
+    style(ws, r, 4, "5Y window balances recency vs statistical robustness", italic=True, size=9, color="555555")
+    r += 1
+
+    style(ws, r, 1, "Benchmark")
+    ws.cell(row=r, column=2, value="S&P 500 (^GSPC)").alignment = _align(h="right")
+    style(ws, r, 3, "Standard US equity market proxy")
+    style(ws, r, 4, "Used as the market portfolio in CAPM", italic=True, size=9, color="555555")
+    r += 1
+
+    n_obs = bd["n"] if bd else "N/A"
+    style(ws, r, 1, "Observations (N)")
+    c = ws.cell(row=r, column=2, value=n_obs)
+    c.number_format = "#,##0"; c.alignment = _align(h="right")
+    style(ws, r, 3, "Weekly return pairs aligned on common trading dates")
+    r += 1
+
+    # Return statistics
+    r += 1
+    section_label(ws, r, "  STEP 1 — RETURN STATISTICS"); r += 1
+
+    avg_s = bd["avg_stock"] if bd else None
+    avg_m = bd["avg_mkt"]   if bd else None
+    std_s = bd["std_stock"] if bd else None
+    std_m = bd["std_mkt"]   if bd else None
+
+    style(ws, r, 1, "Avg weekly return — Stock")
+    c = ws.cell(row=r, column=2, value=avg_s)
+    c.number_format = "0.0000%"; c.alignment = _align(h="right")
+    style(ws, r, 3, f"Mean of {n_obs} weekly returns" if bd else "")
+    style(ws, r, 4, "Simple arithmetic mean of weekly percentage returns", italic=True, size=9, color="555555")
+    r += 1
+
+    style(ws, r, 1, "Avg weekly return — S&P 500")
+    c = ws.cell(row=r, column=2, value=avg_m)
+    c.number_format = "0.0000%"; c.alignment = _align(h="right")
+    style(ws, r, 3, f"Mean of {n_obs} weekly S&P 500 returns" if bd else "")
+    r += 1
+
+    style(ws, r, 1, "Std dev — Stock weekly returns")
+    c = ws.cell(row=r, column=2, value=std_s)
+    c.number_format = "0.0000%"; c.alignment = _align(h="right")
+    style(ws, r, 3, f"σ_stock = {std_s:.4%}" if std_s else "")
+    style(ws, r, 4, "Measures total volatility of the stock's weekly returns", italic=True, size=9, color="555555")
+    r += 1
+
+    style(ws, r, 1, "Std dev — S&P 500 weekly returns")
+    c = ws.cell(row=r, column=2, value=std_m)
+    c.number_format = "0.0000%"; c.alignment = _align(h="right")
+    style(ws, r, 3, f"σ_mkt = {std_m:.4%}" if std_m else "")
+    style(ws, r, 4, "Measures total volatility of the market's weekly returns", italic=True, size=9, color="555555")
+    r += 1
+
+    # Covariance and Variance
+    r += 1
+    section_label(ws, r, "  STEP 2 — COVARIANCE & VARIANCE"); r += 1
+
+    cov_val = bd["cov"]     if bd else None
+    var_val = bd["var_mkt"] if bd else None
+
+    style(ws, r, 1, "Cov(Stock, S&P 500)", bold=True)
+    c = ws.cell(row=r, column=2, value=cov_val)
+    c.number_format = "0.00000000"; c.font = _font(bold=True); c.alignment = _align(h="right")
+    style(ws, r, 3, "Cov = E[(r_stock − μ_stock)(r_mkt − μ_mkt)]")
+    style(ws, r, 4, "How much stock & market returns move together; higher = more correlated", italic=True, size=9, color="555555")
+    r += 1
+
+    style(ws, r, 1, "Var(S&P 500)", bold=True)
+    c = ws.cell(row=r, column=2, value=var_val)
+    c.number_format = "0.00000000"; c.font = _font(bold=True); c.alignment = _align(h="right")
+    style(ws, r, 3, "Var = E[(r_mkt − μ_mkt)²]  =  σ_mkt²")
+    style(ws, r, 4, "Market's own return variance; normalises the covariance to give beta", italic=True, size=9, color="555555")
+    r += 1
+
+    # Raw Beta
+    r += 1
+    section_label(ws, r, "  STEP 3 — RAW BETA = Cov / Var"); r += 1
+
+    raw_b_ref = bd["raw_beta"] if bd else beta
+    cov_str   = f"{cov_val:.8f}" if cov_val is not None else "Cov"
+    var_str   = f"{var_val:.8f}" if var_val is not None else "Var"
+
+    style(ws, r, 1, "Raw Beta (OLS slope)", bold=True)
+    c = ws.cell(row=r, column=2, value=raw_b_ref)
+    c.number_format = FMT_2DP; c.font = _font(bold=True); c.fill = _fill(LIGHT_GRAY); c.alignment = _align(h="right")
+    style(ws, r, 3, f"= {cov_str} / {var_str}")
+    style(ws, r, 4, "OLS regression slope; how much the stock moves per 1% market move", italic=True, size=9, color="555555")
+    r += 1
+
+    r2_val = bd["r_sq"] if bd else None
+    style(ws, r, 1, "R-Squared (R²)")
+    c = ws.cell(row=r, column=2, value=r2_val)
+    c.number_format = FMT_2DP; c.alignment = _align(h="right")
+    style(ws, r, 3, "R² = Corr(r_stock, r_mkt)²")
+    style(ws, r, 4, "% of stock return variance explained by market; remainder is idiosyncratic risk", italic=True, size=9, color="555555")
+    r += 1
+
+    # Blume Adjustment
+    r += 1
+    section_label(ws, r, "  STEP 4 — BLUME ADJUSTMENT = ⅔ × Raw Beta + ⅓ × 1.0"); r += 1
+
+    adj_b_ref = bd["adj_beta"] if bd else round((2 / 3) * raw_b_ref + (1 / 3) * 1.0, 4)
+    term1     = round((2 / 3) * raw_b_ref, 4)
+    term2     = round(1 / 3, 4)
+
+    style(ws, r, 1, "⅔ × Raw Beta")
+    c = ws.cell(row=r, column=2, value=term1)
+    c.number_format = FMT_2DP; c.alignment = _align(h="right")
+    style(ws, r, 3, f"= ⅔ × {raw_b_ref:.4f} = {term1:.4f}")
+    r += 1
+
+    style(ws, r, 1, "⅓ × 1.0 (mean-reversion anchor)")
+    c = ws.cell(row=r, column=2, value=term2)
+    c.number_format = FMT_2DP; c.alignment = _align(h="right")
+    style(ws, r, 3, "= ⅓ × 1.0 = 0.3333")
+    style(ws, r, 4, "Blume (1975): raw betas revert toward 1.0 over time", italic=True, size=9, color="555555")
+    r += 1
+
+    style(ws, r, 1, "Adjusted Beta → used in CAPM above", bold=True)
+    c = ws.cell(row=r, column=2, value=adj_b_ref)
+    c.number_format = FMT_2DP; c.font = _font(bold=True, color=BLUE_TEXT)
+    c.fill = _fill(LIGHT_BLUE); c.alignment = _align(h="right")
+    style(ws, r, 3, f"= {term1:.4f} + {term2:.4f} = {adj_b_ref:.4f}")
+    style(ws, r, 4, "This value is the Beta input in the CAPM section above", italic=True, size=9, color=GREEN_TEXT)
+    r += 1
+
+    style(ws, r, 1, "Yahoo Finance Beta (reference only)", italic=True)
+    c = ws.cell(row=r, column=2, value=beta)
+    c.number_format = FMT_2DP; c.font = _font(italic=True, color="888888"); c.alignment = _align(h="right")
+    style(ws, r, 3, "YF uses 5Y monthly returns vs S&P 500 — slightly different methodology")
+    style(ws, r, 4, "Shown for comparison only; OLS-derived beta used in this model", italic=True, size=9, color="555555")
 
 
 def build_comps(wb, info, sym):
@@ -1306,6 +1609,15 @@ def main():
     print(f"\nFetching data for {sym}...")
     t, info, fin, bs, cf = fetch(sym)
 
+    print(f"  Deriving beta via 5Y weekly OLS regression vs ^GSPC...")
+    beta_data = derive_beta(sym)
+    if beta_data is not None:
+        print(f"  Raw β = {beta_data['raw_beta']:.4f}  |  Blume adj β = {beta_data['adj_beta']:.4f}"
+              f"  |  R² = {beta_data['r_sq']:.4f}  |  N = {beta_data['n']} obs")
+        print(f"  Cov(stock,mkt) = {beta_data['cov']:.8f}  |  Var(mkt) = {beta_data['var_mkt']:.8f}")
+    else:
+        print(f"  Beta derivation failed — falling back to Yahoo Finance beta")
+
     name = info.get("longName", sym)
     print(f"  {name} — building model...")
 
@@ -1324,7 +1636,7 @@ def main():
     print("  ✓ 3-Statement Linkage")
     build_dcf(wb, info, sym)
     print("  ✓ DCF Model")
-    build_wacc(wb, info, sym)
+    build_wacc(wb, info, sym, beta_data)
     print("  ✓ WACC Calculation")
     print("  Fetching peer data for Trading Comps (MSFT, GOOGL, META, AMZN, NVDA)...")
     build_comps(wb, info, sym)
